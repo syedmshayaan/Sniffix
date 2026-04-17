@@ -1,0 +1,5 @@
+flask==3.1.0
+flask-socketio==5.5.1
+scapy==2.6.1
+python-mmap==0.7.1
+eventlet==0.40.0

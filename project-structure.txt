@@ -1,0 +1,10 @@
+sniffix/
+|------	app.py
+|------	scanner/
+	|------	network.py
+	|------	portscan.py
+|------	templates/
+	|------	index.html
+|------	static/
+	|------	style.css
+|------	requirements.txt

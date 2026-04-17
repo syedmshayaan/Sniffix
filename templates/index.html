@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!--
+    ============================================================
+    index.html — Sniffix Frontend
+    ============================================================
+    This is the single HTML file that Flask serves when the user
+    opens http://localhost:5000 in their browser.
+
+    Libraries loaded from CDN:
+      - Socket.IO  : Real-time WebSocket communication with the server
+      - Google Fonts: "Share Tech Mono" (terminal/hacker aesthetic)
+
+    Flow:
+      1. User clicks "Scan Network"  → calls GET /api/scan-network
+      2. Devices appear in a list   → user clicks one
+      3. App calls POST /api/scan-device with the selected IP
+      4. Server runs nmap in background, emits WebSocket events
+      5. "scan_complete" event fires → results render on screen
+    ============================================================
+  -->
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Sniffix — Network Scanner</title>
+
+  <!-- Socket.IO client: enables real-time WebSocket communication with Flask-SocketIO -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+
+  <!-- Monospace terminal font for that authentic hacker-tool look -->
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet"/>
+
+  <style>
+    /* ============================================================
+       CSS VARIABLES — central theme config, change these to retheme
+       ============================================================ */
+    :root {
+      --bg:           #0a0c0f;       /* Near-black background */
+      --bg2:          #0f1318;       /* Slightly lighter panel bg */
+      --bg3:          #151b22;       /* Card / row background */
+      --border:       #1e2d3d;       /* Subtle blue-tinted borders */
+      --accent:       #00e5ff;       /* Cyan — primary highlight */
+      --accent2:      #00ff88;       /* Green — secondary highlight (open ports) */
+      --warn:         #ff9500;       /* Orange — warnings / OS info */
+      --danger:       #ff3b5c;       /* Red — errors */
+      --text:         #cdd9e5;       /* Main text */
+      --text-dim:     #4a6070;       /* Dimmed / secondary text */
+      --font-mono:    'Share Tech Mono', monospace;
+      --font-ui:      'Rajdhani', sans-serif;
+      --glow:         0 0 12px rgba(0, 229, 255, 0.25);
+      --glow-green:   0 0 12px rgba(0, 255, 136, 0.25);
+    }
+
+    /* ============================================================
+       RESET + BASE
+       ============================================================ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-mono);
+      min-height: 100vh;
+      overflow-x: hidden;
+
+      /* Subtle scanline overlay — makes it feel like an old CRT terminal */
+      background-image: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0, 229, 255, 0.012) 2px,
+        rgba(0, 229, 255, 0.012) 4px
+      );
+    }
+
+    /* Animated grid background — gives the "cyber map" feel */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(0, 229, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 229, 255, 0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    /* Everything sits above the grid */
+    .app-wrapper {
+      position: relative;
+      z-index: 1;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px 20px 60px;
+    }
+
+    /* ============================================================
+       HEADER
+       ============================================================ */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 20px;
+      margin-bottom: 32px;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    /* The "> _" blinking cursor logo */
+    .logo-icon {
+      font-size: 22px;
+      color: var(--accent);
+      text-shadow: var(--glow);
+      animation: blink 1.2s step-end infinite;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0; }
+    }
+
+    .logo-text {
+      font-family: var(--font-ui);
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: 6px;
+      color: var(--accent);
+      text-shadow: var(--glow);
+      text-transform: uppercase;
+    }
+
+    .logo-sub {
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+    }
+
+    /* Connection status badge in top right */
+    #connection-status {
+      font-size: 11px;
+      letter-spacing: 2px;
+      color: var(--text-dim);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      transition: all 0.4s;
+    }
+
+    .status-dot.connected {
+      background: var(--accent2);
+      box-shadow: var(--glow-green);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(1);   opacity: 1; }
+      50%       { transform: scale(1.4); opacity: 0.7; }
+    }
+
+    /* ============================================================
+       SECTION LABELS
+       ============================================================ */
+    .section-label {
+      font-size: 10px;
+      letter-spacing: 3px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .section-label::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* ============================================================
+       SCAN NETWORK BUTTON
+       ============================================================ */
+    .scan-bar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .btn {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      border: 1px solid var(--accent);
+      background: transparent;
+      color: var(--accent);
+      padding: 10px 24px;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+      transition: all 0.2s;
+      clip-path: polygon(8px 0%, 100% 0%, calc(100% - 8px) 100%, 0% 100%); /* Angled corners */
+    }
+
+    /* Hover fill sweep animation */
+    .btn::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: var(--accent);
+      transform: translateX(-101%);
+      transition: transform 0.2s;
+      z-index: 0;
+    }
+
+    .btn:hover::before  { transform: translateX(0); }
+    .btn:hover          { color: var(--bg); box-shadow: var(--glow); }
+    .btn span           { position: relative; z-index: 1; }
+    .btn:disabled       { opacity: 0.35; cursor: not-allowed; }
+    .btn:disabled::before { display: none; }
+
+    /* Danger/red variant */
+    .btn.danger {
+      border-color: var(--danger);
+      color: var(--danger);
+    }
+    .btn.danger::before { background: var(--danger); }
+
+    /* Status text next to button */
+    #scan-status-text {
+      font-size: 12px;
+      color: var(--text-dim);
+      letter-spacing: 1px;
+    }
+
+    /* ============================================================
+       DEVICE LIST TABLE
+       ============================================================ */
+    .device-table-wrapper {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      margin-bottom: 32px;
+      min-height: 120px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead th {
+      font-size: 10px;
+      letter-spacing: 3px;
+      color: var(--text-dim);
+      text-align: left;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      text-transform: uppercase;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    tbody tr:last-child { border-bottom: none; }
+
+    tbody tr:hover {
+      background: rgba(0, 229, 255, 0.05);
+    }
+
+    /* Highlighted/selected row */
+    tbody tr.selected {
+      background: rgba(0, 229, 255, 0.08);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+
+    tbody td {
+      padding: 11px 16px;
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    .td-ip {
+      color: var(--accent);
+      text-shadow: var(--glow);
+    }
+
+    .td-mac  { color: var(--text-dim); font-size: 12px; }
+
+    .td-hostname { color: var(--text); }
+
+    /* Row slide-in animation for when devices are discovered */
+    @keyframes row-in {
+      from { opacity: 0; transform: translateX(-10px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+
+    .device-row {
+      animation: row-in 0.3s ease forwards;
+    }
+
+    /* Empty / loading states inside the table */
+    .table-empty {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-dim);
+      font-size: 12px;
+      letter-spacing: 2px;
+    }
+
+    /* ============================================================
+       SPINNER — shown while scanning
+       ============================================================ */
+    .spinner-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--accent);
+      font-size: 12px;
+      letter-spacing: 2px;
+    }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* ============================================================
+       SCAN PORT BUTTON ROW
+       ============================================================ */
+    .port-scan-bar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    #selected-target-label {
+      font-size: 12px;
+      color: var(--text-dim);
+      letter-spacing: 1px;
+    }
+
+    #selected-target-label span {
+      color: var(--accent);
+      text-shadow: var(--glow);
+    }
+
+    /* ============================================================
+       RESULTS PANEL
+       ============================================================ */
+    #results-section { display: none; } /* Hidden until scan completes */
+
+    /* Device info cards row */
+    .info-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+
+    .info-card {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      padding: 14px 16px;
+      position: relative;
+      overflow: hidden;
+      animation: card-in 0.4s ease forwards;
+      opacity: 0;
+    }
+
+    /* Staggered animation delays for each card */
+    .info-card:nth-child(1) { animation-delay: 0.05s; }
+    .info-card:nth-child(2) { animation-delay: 0.10s; }
+    .info-card:nth-child(3) { animation-delay: 0.15s; }
+    .info-card:nth-child(4) { animation-delay: 0.20s; }
+    .info-card:nth-child(5) { animation-delay: 0.25s; }
+
+    @keyframes card-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Accent line on the left edge */
+    .info-card::before {
+      content: '';
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 2px;
+      background: var(--accent);
+      box-shadow: var(--glow);
+    }
+
+    .info-card-label {
+      font-size: 9px;
+      letter-spacing: 3px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .info-card-value {
+      font-size: 14px;
+      color: var(--text);
+      word-break: break-all;
+    }
+
+    .info-card-value.highlight {
+      color: var(--accent);
+      text-shadow: var(--glow);
+    }
+
+    /* ============================================================
+       OPEN PORTS TABLE
+       ============================================================ */
+    .ports-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .port-count-badge {
+      font-size: 11px;
+      color: var(--accent2);
+      border: 1px solid var(--accent2);
+      padding: 2px 10px;
+      letter-spacing: 2px;
+    }
+
+    .port-row {
+      animation: row-in 0.3s ease forwards;
+      opacity: 0;
+    }
+
+    /* Stagger port rows for a nice cascade effect */
+    .port-row:nth-child(1)  { animation-delay: 0.05s; }
+    .port-row:nth-child(2)  { animation-delay: 0.10s; }
+    .port-row:nth-child(3)  { animation-delay: 0.15s; }
+    .port-row:nth-child(4)  { animation-delay: 0.20s; }
+    .port-row:nth-child(5)  { animation-delay: 0.25s; }
+    .port-row:nth-child(6)  { animation-delay: 0.30s; }
+    .port-row:nth-child(7)  { animation-delay: 0.35s; }
+    .port-row:nth-child(8)  { animation-delay: 0.40s; }
+    .port-row:nth-child(9)  { animation-delay: 0.45s; }
+    .port-row:nth-child(10) { animation-delay: 0.50s; }
+
+    /* Port number pill */
+    .port-pill {
+      display: inline-block;
+      background: rgba(0, 229, 255, 0.08);
+      border: 1px solid rgba(0, 229, 255, 0.3);
+      color: var(--accent);
+      padding: 2px 10px;
+      font-size: 13px;
+      text-shadow: var(--glow);
+    }
+
+    /* Open state badge */
+    .state-open {
+      color: var(--accent2);
+      font-size: 11px;
+      letter-spacing: 2px;
+      text-shadow: var(--glow-green);
+    }
+
+    .td-service  { color: var(--warn); }
+    .td-version  { color: var(--text-dim); font-size: 12px; }
+    .td-protocol { color: var(--text-dim); font-size: 11px; letter-spacing: 1px; }
+
+    /* ============================================================
+       ERROR BANNER
+       ============================================================ */
+    .error-banner {
+      background: rgba(255, 59, 92, 0.08);
+      border: 1px solid var(--danger);
+      color: var(--danger);
+      padding: 12px 16px;
+      font-size: 12px;
+      letter-spacing: 1px;
+      margin-bottom: 20px;
+      display: none;
+    }
+
+    /* ============================================================
+       PROGRESS BAR — shown during port scan
+       ============================================================ */
+    .progress-wrap {
+      display: none;
+      margin-bottom: 20px;
+    }
+
+    .progress-label {
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+      margin-bottom: 6px;
+    }
+
+    .progress-bar-bg {
+      height: 2px;
+      background: var(--border);
+      width: 100%;
+      overflow: hidden;
+    }
+
+    /* Indeterminate sliding bar — we don't know % done, so we just animate it */
+    .progress-bar-fill {
+      height: 100%;
+      width: 40%;
+      background: var(--accent);
+      box-shadow: var(--glow);
+      animation: slide-bar 1.5s ease-in-out infinite;
+    }
+
+    @keyframes slide-bar {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(350%); }
+    }
+
+    /* ============================================================
+       LOG CONSOLE — scrollable terminal-style output log
+       ============================================================ */
+    .log-console {
+      background: #070a0d;
+      border: 1px solid var(--border);
+      padding: 12px 16px;
+      height: 120px;
+      overflow-y: auto;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 32px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .log-line { margin-bottom: 3px; line-height: 1.6; }
+    .log-line.info   { color: var(--text-dim); }
+    .log-line.ok     { color: var(--accent2); }
+    .log-line.warn   { color: var(--warn); }
+    .log-line.error  { color: var(--danger); }
+    .log-line.accent { color: var(--accent); }
+
+    /* Footer */
+    footer {
+      margin-top: 48px;
+      border-top: 1px solid var(--border);
+      padding-top: 16px;
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+      display: flex;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+
+<body>
+<div class="app-wrapper">
+
+  <!-- ============================================================
+       HEADER
+       ============================================================ -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">&gt;_</div>
+      <div>
+        <div class="logo-text">Sniffix</div>
+        <div class="logo-sub">LOCAL NETWORK PORT SCANNER</div>
+      </div>
+    </div>
+
+    <!-- Shows whether the browser is connected to the Flask WebSocket server -->
+    <div id="connection-status">
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-text">CONNECTING...</span>
+    </div>
+  </header>
+
+
+  <!-- ============================================================
+       STEP 1 — SCAN NETWORK
+       ============================================================ -->
+  <div class="section-label">01 / DISCOVER DEVICES</div>
+
+  <div class="scan-bar">
+    <!-- Clicking this calls GET /api/scan-network -->
+    <button class="btn" id="btn-scan-network" onclick="startNetworkScan()">
+      <span>⬡ Scan Network</span>
+    </button>
+    <div id="scan-status-text">— ready</div>
+  </div>
+
+  <!-- Error banner — shown if network scan fails -->
+  <div class="error-banner" id="network-error"></div>
+
+  <!-- Device list table -->
+  <div class="device-table-wrapper">
+    <table id="device-table">
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>MAC Address</th>
+          <th>Hostname</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="device-tbody">
+        <!-- Device rows are injected here by JavaScript -->
+        <tr>
+          <td colspan="4" class="table-empty">
+            — run a network scan to discover devices —
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+
+  <!-- ============================================================
+       STEP 2 — PORT SCAN A DEVICE
+       ============================================================ -->
+  <div class="section-label">02 / PORT SCAN TARGET</div>
+
+  <div class="port-scan-bar">
+    <!-- Clicking this calls POST /api/scan-device with the selected IP -->
+    <button class="btn" id="btn-scan-ports" onclick="startPortScan()" disabled>
+      <span>⬡ Scan Ports</span>
+    </button>
+    <div id="selected-target-label">— select a device above first —</div>
+  </div>
+
+  <!-- Indeterminate progress bar — shown while nmap is running -->
+  <div class="progress-wrap" id="progress-wrap">
+    <div class="progress-label">SCANNING PORTS — THIS MAY TAKE UP TO 90 SECONDS...</div>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill"></div>
+    </div>
+  </div>
+
+  <!-- Error banner — shown if port scan fails -->
+  <div class="error-banner" id="scan-error"></div>
+
+
+  <!-- ============================================================
+       STEP 3 — RESULTS
+       ============================================================ -->
+  <div id="results-section">
+
+    <div class="section-label">03 / SCAN RESULTS</div>
+
+    <!-- Device info cards — IP, OS, MAC, Vendor, Hostname -->
+    <div class="info-cards" id="info-cards"></div>
+
+    <!-- Open ports table -->
+    <div class="ports-header">
+      <div class="section-label" style="margin-bottom:0; flex:1">OPEN PORTS</div>
+      <div class="port-count-badge" id="port-count-badge">0 OPEN</div>
+    </div>
+
+    <div class="device-table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Port</th>
+            <th>Protocol</th>
+            <th>State</th>
+            <th>Service</th>
+            <th>Version / Info</th>
+          </tr>
+        </thead>
+        <tbody id="ports-tbody">
+          <!-- Port rows injected here -->
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+
+  <!-- ============================================================
+       LOG CONSOLE — live terminal-style activity log
+       ============================================================ -->
+  <div class="section-label" style="margin-top: 32px;">ACTIVITY LOG</div>
+  <div class="log-console" id="log-console">
+    <div class="log-line info">// sniffix initializing...</div>
+  </div>
+
+
+  <!-- ============================================================
+       FOOTER
+       ============================================================ -->
+  <footer>
+    <span>SNIFFIX v1.0 — NETWORK SCANNER</span>
+    <span>RUN WITH: sudo python app.py</span>
+  </footer>
+
+</div><!-- end .app-wrapper -->
+
+
+<!-- ============================================================
+     JAVASCRIPT
+     ============================================================
+     All client-side logic lives here.
+
+     Key responsibilities:
+       1. Connect to Flask-SocketIO via WebSocket
+       2. Handle "Scan Network" — fetch devices, render table
+       3. Handle device selection
+       4. Handle "Scan Ports" — POST to server, show progress
+       5. Listen for WebSocket events and render results
+       6. Log all activity to the console panel
+     ============================================================ -->
+<script>
+
+  // ============================================================
+  // STATE — tracks what the user has selected
+  // ============================================================
+  let selectedIP  = null;   // The IP address the user clicked on
+  let isScanning  = false;  // Prevents double-clicking scan buttons
+
+
+  // ============================================================
+  // WEBSOCKET SETUP
+  // ============================================================
+
+  // Connect to the Flask-SocketIO server
+  // By default it connects to the same host that served the page
+  const socket = io();
+
+  // Fires when the WebSocket connection is established
+  socket.on("connect", () => {
+    log("WebSocket connected to Sniffix server.", "ok");
+    document.getElementById("status-dot").classList.add("connected");
+    document.getElementById("status-text").textContent = "CONNECTED";
+  });
+
+  // Fires when disconnected
+  socket.on("disconnect", () => {
+    log("WebSocket disconnected.", "error");
+    document.getElementById("status-dot").classList.remove("connected");
+    document.getElementById("status-text").textContent = "DISCONNECTED";
+  });
+
+  // Server confirmed it received our connection
+  socket.on("connected", (data) => {
+    log(data.message, "accent");
+  });
+
+  // Server says the nmap scan has begun
+  socket.on("scan_started", (data) => {
+    log(`Port scan initiated on ${data.ip} — waiting for nmap...`, "accent");
+  });
+
+  // Server finished the nmap scan and sent back results
+  socket.on("scan_complete", (data) => {
+    log(`Scan complete for ${data.ip}.`, "ok");
+    hideProgress();
+    renderResults(data);    // Render the results in the UI
+    isScanning = false;
+  });
+
+  // Something went wrong during the scan
+  socket.on("scan_error", (data) => {
+    log(`Scan error: ${data.error}`, "error");
+    showScanError(data.error);
+    hideProgress();
+    isScanning = false;
+  });
+
+
+  // ============================================================
+  // NETWORK SCAN — Step 1
+  // ============================================================
+
+  async function startNetworkScan() {
+    /*
+      Called when the user clicks "Scan Network".
+      Sends a GET request to /api/scan-network.
+      On success, populates the device table.
+    */
+
+    if (isScanning) return;
+    isScanning = true;
+
+    // Reset UI
+    document.getElementById("btn-scan-network").disabled = true;
+    document.getElementById("scan-status-text").innerHTML =
+      `<span class="spinner-wrap"><span class="spinner"></span> scanning network...</span>`;
+    document.getElementById("network-error").style.display = "none";
+    document.getElementById("device-tbody").innerHTML =
+      `<tr><td colspan="4" class="table-empty"><span class="spinner-wrap" style="justify-content:center"><span class="spinner"></span> sending ARP broadcast...</span></td></tr>`;
+
+    log("Starting ARP network scan...", "accent");
+
+    try {
+      // Fetch devices from the Flask API
+      const response = await fetch("/api/scan-network");
+      const data     = await response.json();
+
+      if (!data.success) throw new Error(data.error || "Unknown error");
+
+      log(`Network scan complete. Found ${data.devices.length} device(s).`, "ok");
+      renderDeviceTable(data.devices);
+
+    } catch (err) {
+      log(`Network scan failed: ${err.message}`, "error");
+      document.getElementById("network-error").textContent = `Error: ${err.message}`;
+      document.getElementById("network-error").style.display = "block";
+      document.getElementById("device-tbody").innerHTML =
+        `<tr><td colspan="4" class="table-empty">scan failed — see error above</td></tr>`;
+    }
+
+    document.getElementById("btn-scan-network").disabled = false;
+    document.getElementById("scan-status-text").textContent = "— scan complete";
+    isScanning = false;
+  }
+
+
+  // ============================================================
+  // RENDER DEVICE TABLE
+  // ============================================================
+
+  function renderDeviceTable(devices) {
+    /*
+      Takes the array of devices from the API and builds
+      HTML table rows dynamically.
+    */
+    const tbody = document.getElementById("device-tbody");
+
+    if (devices.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="4" class="table-empty">no devices found on this subnet</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = "";   // Clear existing rows
+
+    devices.forEach((device, index) => {
+      const tr = document.createElement("tr");
+      tr.className = "device-row";
+      tr.style.animationDelay = `${index * 0.06}s`;   // Stagger row reveal
+
+      tr.innerHTML = `
+        <td class="td-ip">${device.ip}</td>
+        <td class="td-mac">${device.mac}</td>
+        <td class="td-hostname">${device.hostname}</td>
+        <td>
+          <button class="btn" style="padding:4px 14px; font-size:11px"
+            onclick="selectDevice('${device.ip}', this)">
+            <span>Select</span>
+          </button>
+        </td>
+      `;
+
+      tbody.appendChild(tr);
+    });
+
+    log(`Rendered ${devices.length} device(s) in the table.`, "info");
+  }
+
+
+  // ============================================================
+  // DEVICE SELECTION
+  // ============================================================
+
+  function selectDevice(ip, buttonEl) {
+    /*
+      Called when user clicks "Select" on a device row.
+      Highlights the row and enables the port scan button.
+    */
+
+    selectedIP = ip;
+
+    // Remove "selected" class from all rows, then highlight this one
+    document.querySelectorAll("#device-tbody tr").forEach(r => r.classList.remove("selected"));
+    buttonEl.closest("tr").classList.add("selected");
+
+    // Update the target label
+    document.getElementById("selected-target-label").innerHTML =
+      `TARGET: <span>${ip}</span>`;
+
+    // Enable the port scan button
+    document.getElementById("btn-scan-ports").disabled = false;
+
+    // Hide old results and errors
+    document.getElementById("results-section").style.display = "none";
+    document.getElementById("scan-error").style.display = "none";
+
+    log(`Selected target: ${ip}`, "accent");
+  }
+
+
+  // ============================================================
+  // PORT SCAN — Step 2
+  // ============================================================
+
+  async function startPortScan() {
+    /*
+      Called when the user clicks "Scan Ports".
+      POSTs the selected IP to /api/scan-device.
+      The actual results come back later via WebSocket.
+    */
+
+    if (!selectedIP || isScanning) return;
+    isScanning = true;
+
+    // Show progress, hide old results
+    showProgress();
+    document.getElementById("results-section").style.display = "none";
+    document.getElementById("scan-error").style.display = "none";
+    document.getElementById("btn-scan-ports").disabled = true;
+
+    log(`Initiating port scan on ${selectedIP}...`, "accent");
+
+    try {
+      // POST the target IP to the Flask API
+      const response = await fetch("/api/scan-device", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ ip: selectedIP })
+      });
+
+      const data = await response.json();
+
+      if (!data.success) throw new Error(data.error || "Unknown error");
+
+      log(`Server acknowledged scan request for ${selectedIP}.`, "ok");
+      log("Waiting for nmap to complete (this takes ~60 seconds)...", "warn");
+
+    } catch (err) {
+      log(`Failed to start port scan: ${err.message}`, "error");
+      showScanError(err.message);
+      hideProgress();
+      document.getElementById("btn-scan-ports").disabled = false;
+      isScanning = false;
+    }
+  }
+
+
+  // ============================================================
+  // RENDER RESULTS
+  // ============================================================
+
+  function renderResults(data) {
+    /*
+      Renders the device info cards and open ports table
+      using the data emitted by the "scan_complete" WebSocket event.
+    */
+
+    // Show the results section
+    const section = document.getElementById("results-section");
+    section.style.display = "block";
+    section.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    // --- Device Info Cards ---
+    const cards = [
+      { label: "IP Address",  value: data.ip,       highlight: true },
+      { label: "Hostname",    value: data.hostname,  highlight: false },
+      { label: "OS Guess",    value: data.os,        highlight: false },
+      { label: "MAC Address", value: data.mac,       highlight: false },
+      { label: "NIC Vendor",  value: data.vendor,    highlight: false },
+    ];
+
+    document.getElementById("info-cards").innerHTML = cards.map(card => `
+      <div class="info-card">
+        <div class="info-card-label">${card.label}</div>
+        <div class="info-card-value ${card.highlight ? 'highlight' : ''}">
+          ${card.value || "—"}
+        </div>
+      </div>
+    `).join("");
+
+    // --- Open Ports Table ---
+    const tbody = document.getElementById("ports-tbody");
+    const ports = data.ports || [];
+
+    document.getElementById("port-count-badge").textContent = `${ports.length} OPEN`;
+
+    if (ports.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="5" class="table-empty">no open ports found</td></tr>`;
+    } else {
+      tbody.innerHTML = ports.map((p, i) => `
+        <tr class="port-row" style="animation-delay:${i * 0.05}s">
+          <td><span class="port-pill">${p.port}</span></td>
+          <td class="td-protocol">${p.protocol.toUpperCase()}</td>
+          <td><span class="state-open">● OPEN</span></td>
+          <td class="td-service">${p.service || "—"}</td>
+          <td class="td-version">${p.version || "—"}</td>
+        </tr>
+      `).join("");
+    }
+
+    // Re-enable the scan button for another scan
+    document.getElementById("btn-scan-ports").disabled = false;
+    log(`Results rendered: ${ports.length} open port(s) on ${data.ip}.`, "ok");
+  }
+
+
+  // ============================================================
+  // HELPERS — progress bar, error banners, log console
+  // ============================================================
+
+  function showProgress() {
+    document.getElementById("progress-wrap").style.display = "block";
+  }
+
+  function hideProgress() {
+    document.getElementById("progress-wrap").style.display = "none";
+  }
+
+  function showScanError(message) {
+    const el = document.getElementById("scan-error");
+    el.textContent = `Scan error: ${message}`;
+    el.style.display = "block";
+  }
+
+  function log(message, type = "info") {
+    /*
+      Appends a line to the activity log console at the bottom.
+      type can be: "info", "ok", "warn", "error", "accent"
+    */
+    const console_el = document.getElementById("log-console");
+    const timestamp  = new Date().toLocaleTimeString("en-GB");   // HH:MM:SS
+
+    const line = document.createElement("div");
+    line.className = `log-line ${type}`;
+    line.textContent = `[${timestamp}] ${message}`;
+
+    console_el.appendChild(line);
+    console_el.scrollTop = console_el.scrollHeight;   // Auto-scroll to bottom
+  }
+
+</script>
+</body>
+</html>
