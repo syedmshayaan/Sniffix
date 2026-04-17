@@ -67,7 +67,7 @@ def scan_device(ip_address):
     # --- Run the nmap scan ---
     # arguments="-sV -O -T4 --open" passes these flags to the nmap CLI tool
     # This may take 30–90 seconds depending on the device and network
-    nm.scan(hosts=ip_address, arguments="-sV -O -T4 --open")
+    nm.scan(hosts=ip_address, arguments="-sV -T4 --open --host-timeout 60s -F")
 
     # If nmap couldn't reach the host or got no results, return an error dict
     if ip_address not in nm.all_hosts():
