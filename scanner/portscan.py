@@ -1,34 +1,17 @@
 # ============================================================
-# portscan.py — Custom Port Scanner using Python Sockets
+# portscan.py — Socket-based Port Scanner
 # ============================================================
-# Instead of using nmap (which is slow), we write our own
-# port scanner using Python's built-in 'socket' library.
-#
-# HOW IT WORKS:
-#   For each port we want to check, we attempt to open a
-#   TCP connection to that port on the target device.
-#   - If the connection SUCCEEDS → port is OPEN
-#   - If the connection is REFUSED → port is CLOSED
-#   - If it TIMES OUT → port is FILTERED (firewall blocking)
-#
-# We use THREADING to scan multiple ports simultaneously
-# instead of one by one — this makes it dramatically faster.
-#
-# WHY SOCKETS OVER NMAP:
-#   nmap is powerful but slow for demos. Python's socket
-#   library gives us direct control and instant feedback.
+# Uses concurrent.futures.ThreadPoolExecutor instead of
+# threading.Thread directly — this avoids conflicts with
+# eventlet's monkey-patching of Python's socket/thread libs.
 # ============================================================
 
 import socket
-import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ============================================================
-# WELL-KNOWN PORTS DICTIONARY
-# Maps port numbers to their common service names.
-# ============================================================
+# Well-known port → service name mapping
 COMMON_SERVICES = {
-    20:    "FTP Data",
-    21:    "FTP Control",
+    21:    "FTP",
     22:    "SSH",
     23:    "Telnet",
     25:    "SMTP",
@@ -49,47 +32,38 @@ COMMON_SERVICES = {
     993:   "IMAPS",
     995:   "POP3S",
     1080:  "SOCKS Proxy",
-    1433:  "MS SQL Server",
+    1433:  "MS SQL",
     1521:  "Oracle DB",
     1723:  "PPTP VPN",
     2049:  "NFS",
-    2222:  "SSH Alternate",
+    2222:  "SSH Alt",
     3000:  "Dev Server",
     3306:  "MySQL",
-    3389:  "RDP (Remote Desktop)",
+    3389:  "RDP",
     4444:  "Metasploit",
-    5000:  "Flask / UPnP",
+    5000:  "Flask/UPnP",
     5432:  "PostgreSQL",
     5900:  "VNC",
     6379:  "Redis",
     8000:  "HTTP Alt",
     8080:  "HTTP Proxy",
     8443:  "HTTPS Alt",
-    8888:  "Jupyter Notebook",
+    8888:  "Jupyter",
     9200:  "Elasticsearch",
     27017: "MongoDB",
 }
 
-# Ports to scan
-TOP_PORTS = list(COMMON_SERVICES.keys())
-
-# Timeout per port (seconds) — keep low for speed
-TIMEOUT = 0.5
-
-# Max simultaneous threads
-MAX_THREADS = 100
+TOP_PORTS  = list(COMMON_SERVICES.keys())
+TIMEOUT    = 1      # seconds per port attempt
+MAX_WORKERS = 50    # concurrent threads in the pool
 
 
-def check_port(ip, port, open_ports, lock):
+def check_port(ip, port):
     """
-    Attempts a TCP connection to a single port.
-    Adds to open_ports list if successful.
+    Attempts a TCP connection to ip:port.
 
-    Args:
-        ip         (str)  : Target IP
-        port       (int)  : Port to check
-        open_ports (list) : Shared results list
-        lock       (Lock) : Thread lock for safe list writes
+    Returns:
+        dict if port is open, None if closed/filtered
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -98,93 +72,87 @@ def check_port(ip, port, open_ports, lock):
         sock.close()
 
         if result == 0:
-            # Port is open — log it
-            with lock:
-                open_ports.append({
-                    "port":     port,
-                    "protocol": "tcp",
-                    "state":    "open",
-                    "service":  COMMON_SERVICES.get(port, "Unknown"),
-                    "version":  "N/A"
-                })
-    except (socket.timeout, socket.error):
+            return {
+                "port":     port,
+                "protocol": "tcp",
+                "state":    "open",
+                "service":  COMMON_SERVICES.get(port, "Unknown"),
+                "version":  "N/A"
+            }
+    except Exception:
         pass
-
-
-def get_device_info(ip):
-    """
-    Gets basic device info (hostname via reverse DNS).
-    """
-    try:
-        hostname = socket.gethostbyaddr(ip)[0]
-    except socket.herror:
-        hostname = "Unknown"
-
-    return {
-        "hostname": hostname,
-        "os":       "N/A (nmap -O disabled for speed)",
-        "mac":      "See network scan above",
-        "vendor":   "See network scan above"
-    }
+    return None
 
 
 def scan_device(ip_address, socketio=None):
     """
-    Multithreaded TCP port scan on a target IP.
+    Scans a target IP for open ports using a thread pool.
 
     Args:
         ip_address (str)     : Target IP
-        socketio   (SocketIO): Optional, for live browser updates
+        socketio   (SocketIO): Optional, emits live progress to browser
 
     Returns:
-        dict: open ports + device info
+        dict: open ports + basic device info
     """
-    print(f"[*] Socket scan starting on {ip_address} — {len(TOP_PORTS)} ports, {MAX_THREADS} threads")
+    print(f"[*] Scanning {ip_address} — {len(TOP_PORTS)} ports")
 
-    open_ports = []
-    lock = threading.Lock()
-    threads = []
-    total = len(TOP_PORTS)
+    open_ports  = []
+    total       = len(TOP_PORTS)
+    completed   = 0
 
     if socketio:
-        socketio.emit("scan_progress", {"message": f"Scanning {total} ports on {ip_address}...", "percent": 0})
+        socketio.emit("scan_progress", {
+            "message": f"Starting scan on {ip_address}...",
+            "percent": 0
+        })
 
-    for i, port in enumerate(TOP_PORTS):
-        t = threading.Thread(target=check_port, args=(ip_address, port, open_ports, lock))
-        t.daemon = True
-        threads.append(t)
-        t.start()
+    # ThreadPoolExecutor is safer with eventlet than raw threading.Thread
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-        # Emit progress every 10 ports
-        if socketio and i % 10 == 0:
-            socketio.emit("scan_progress", {
-                "message": f"Scanning... ({i}/{total} ports)",
-                "percent": int((i / total) * 100)
-            })
+        # Submit all port checks at once
+        futures = {
+            executor.submit(check_port, ip_address, port): port
+            for port in TOP_PORTS
+        }
 
-        # Batch: wait when we hit thread limit
-        if len(threads) >= MAX_THREADS:
-            for t in threads:
-                t.join()
-            threads = []
+        # Process results as each thread finishes
+        for future in as_completed(futures):
+            completed += 1
+            result = future.result()
 
-    # Wait for remaining threads
-    for t in threads:
-        t.join()
+            if result:
+                open_ports.append(result)
+                print(f"  [+] Open: {result['port']} ({result['service']})")
+
+            # Emit progress update every 5 completions
+            if socketio and completed % 5 == 0:
+                percent = int((completed / total) * 100)
+                socketio.emit("scan_progress", {
+                    "message": f"Scanning... {completed}/{total} ports checked",
+                    "percent": percent
+                })
 
     open_ports.sort(key=lambda x: x["port"])
-    print(f"[+] Done. {len(open_ports)} open port(s) on {ip_address}.")
+    print(f"[+] Scan complete — {len(open_ports)} open port(s) on {ip_address}")
 
-    info = get_device_info(ip_address)
+    # Basic device info via reverse DNS
+    try:
+        hostname = socket.gethostbyaddr(ip_address)[0]
+    except socket.herror:
+        hostname = "Unknown"
 
     if socketio:
-        socketio.emit("scan_progress", {"message": f"Done! {len(open_ports)} open port(s) found.", "percent": 100})
+        socketio.emit("scan_progress", {
+            "message": f"Done! Found {len(open_ports)} open port(s).",
+            "percent": 100
+        })
 
     return {
         "ip":       ip_address,
-        "hostname": info["hostname"],
-        "os":       info["os"],
-        "mac":      info["mac"],
-        "vendor":   info["vendor"],
+        "hostname": hostname,
+        "os":       "N/A",
+        "mac":      "See network scan above",
+        "vendor":   "See network scan above",
         "ports":    open_ports
     }
