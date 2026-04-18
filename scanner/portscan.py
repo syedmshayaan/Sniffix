@@ -1,146 +1,190 @@
 # ============================================================
-# portscan.py
+# portscan.py — Custom Port Scanner using Python Sockets
 # ============================================================
-# This module handles scanning a SPECIFIC device (by IP address)
-# to find:
-#   - Which ports are open
-#   - What service/software is running on each port
-#   - The device's operating system (best guess)
-#   - The MAC address vendor (who manufactured the network card)
+# Instead of using nmap (which is slow), we write our own
+# port scanner using Python's built-in 'socket' library.
 #
 # HOW IT WORKS:
-#   We use nmap (Network Mapper) — the industry-standard open-source
-#   network scanning tool — via the python-nmap wrapper library.
+#   For each port we want to check, we attempt to open a
+#   TCP connection to that port on the target device.
+#   - If the connection SUCCEEDS → port is OPEN
+#   - If the connection is REFUSED → port is CLOSED
+#   - If it TIMES OUT → port is FILTERED (firewall blocking)
 #
-#   nmap sends specially crafted TCP/UDP packets to each port on
-#   the target device and analyzes the responses to determine
-#   whether a port is open, closed, or filtered.
+# We use THREADING to scan multiple ports simultaneously
+# instead of one by one — this makes it dramatically faster.
 #
-# PORT STATES:
-#   open     — something is actively listening on this port
-#   closed   — port is reachable but nothing is listening
-#   filtered — a firewall is blocking our probe packets
-#
-# NOTE: This requires nmap to be installed on the OS.
-#       Install with: sudo apt install nmap (Linux)
-#                  or: brew install nmap (Mac)
+# WHY SOCKETS OVER NMAP:
+#   nmap is powerful but slow for demos. Python's socket
+#   library gives us direct control and instant feedback.
 # ============================================================
 
-import nmap    # python-nmap: a Python wrapper around the nmap command-line tool
+import socket
+import threading
+
+# ============================================================
+# WELL-KNOWN PORTS DICTIONARY
+# Maps port numbers to their common service names.
+# ============================================================
+COMMON_SERVICES = {
+    20:    "FTP Data",
+    21:    "FTP Control",
+    22:    "SSH",
+    23:    "Telnet",
+    25:    "SMTP",
+    53:    "DNS",
+    80:    "HTTP",
+    110:   "POP3",
+    123:   "NTP",
+    135:   "MS RPC",
+    139:   "NetBIOS",
+    143:   "IMAP",
+    161:   "SNMP",
+    389:   "LDAP",
+    443:   "HTTPS",
+    445:   "SMB",
+    465:   "SMTPS",
+    587:   "SMTP TLS",
+    631:   "IPP Printer",
+    993:   "IMAPS",
+    995:   "POP3S",
+    1080:  "SOCKS Proxy",
+    1433:  "MS SQL Server",
+    1521:  "Oracle DB",
+    1723:  "PPTP VPN",
+    2049:  "NFS",
+    2222:  "SSH Alternate",
+    3000:  "Dev Server",
+    3306:  "MySQL",
+    3389:  "RDP (Remote Desktop)",
+    4444:  "Metasploit",
+    5000:  "Flask / UPnP",
+    5432:  "PostgreSQL",
+    5900:  "VNC",
+    6379:  "Redis",
+    8000:  "HTTP Alt",
+    8080:  "HTTP Proxy",
+    8443:  "HTTPS Alt",
+    8888:  "Jupyter Notebook",
+    9200:  "Elasticsearch",
+    27017: "MongoDB",
+}
+
+# Ports to scan
+TOP_PORTS = list(COMMON_SERVICES.keys())
+
+# Timeout per port (seconds) — keep low for speed
+TIMEOUT = 0.5
+
+# Max simultaneous threads
+MAX_THREADS = 100
 
 
-def scan_device(ip_address):
+def check_port(ip, port, open_ports, lock):
     """
-    Performs a comprehensive scan on a single target device.
-
-    Scan flags used:
-        -sV   : Version detection — identifies what software is running on each port
-                (e.g. port 22 → OpenSSH 8.2)
-        -O    : OS detection — nmap guesses the operating system based on TCP/IP behavior
-        -T4   : Timing template 4 (aggressive) — faster scan, good for local networks
-        --open: Only show ports that are confirmed OPEN (skip closed/filtered)
+    Attempts a TCP connection to a single port.
+    Adds to open_ports list if successful.
 
     Args:
-        ip_address (str): The IP address of the device to scan (e.g. "192.168.1.5")
+        ip         (str)  : Target IP
+        port       (int)  : Port to check
+        open_ports (list) : Shared results list
+        lock       (Lock) : Thread lock for safe list writes
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(TIMEOUT)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+
+        if result == 0:
+            # Port is open — log it
+            with lock:
+                open_ports.append({
+                    "port":     port,
+                    "protocol": "tcp",
+                    "state":    "open",
+                    "service":  COMMON_SERVICES.get(port, "Unknown"),
+                    "version":  "N/A"
+                })
+    except (socket.timeout, socket.error):
+        pass
+
+
+def get_device_info(ip):
+    """
+    Gets basic device info (hostname via reverse DNS).
+    """
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+    except socket.herror:
+        hostname = "Unknown"
+
+    return {
+        "hostname": hostname,
+        "os":       "N/A (nmap -O disabled for speed)",
+        "mac":      "See network scan above",
+        "vendor":   "See network scan above"
+    }
+
+
+def scan_device(ip_address, socketio=None):
+    """
+    Multithreaded TCP port scan on a target IP.
+
+    Args:
+        ip_address (str)     : Target IP
+        socketio   (SocketIO): Optional, for live browser updates
 
     Returns:
-        dict: A dictionary containing:
-              - 'ip'       : The scanned IP address
-              - 'hostname' : Hostname reported by nmap (if any)
-              - 'os'       : Best OS guess from nmap
-              - 'mac'      : MAC address (if available)
-              - 'vendor'   : MAC vendor / manufacturer name
-              - 'ports'    : List of open ports, each with:
-                               - 'port'    : Port number (e.g. 80)
-                               - 'protocol': "tcp" or "udp"
-                               - 'state'   : "open", "closed", or "filtered"
-                               - 'service' : Service name (e.g. "http")
-                               - 'version' : Software version string (e.g. "Apache 2.4.1")
+        dict: open ports + device info
     """
+    print(f"[*] Socket scan starting on {ip_address} — {len(TOP_PORTS)} ports, {MAX_THREADS} threads")
 
-    # Create a new nmap PortScanner instance
-    # This is the object we use to run scans and read results
-    nm = nmap.PortScanner()
-
-    print(f"[*] Starting port scan on {ip_address} ...")
-
-    # --- Run the nmap scan ---
-    # arguments="-sV -O -T4 --open" passes these flags to the nmap CLI tool
-    # This may take 30–90 seconds depending on the device and network
-    nm.scan(hosts=ip_address, arguments="-sV -T4 --open --host-timeout 60s -F")
-
-    # If nmap couldn't reach the host or got no results, return an error dict
-    if ip_address not in nm.all_hosts():
-        print(f"[!] Host {ip_address} did not respond to scan.")
-        return {
-            "ip": ip_address,
-            "error": "Host did not respond or is unreachable."
-        }
-
-    # --- Extract host-level info ---
-    host_data = nm[ip_address]    # nm[ip] gives us the full result object for that host
-
-    # Hostname: nmap sometimes resolves this, sometimes not
-    # We grab the first hostname entry if available
-    hostname = "Unknown"
-    if host_data.hostname():
-        hostname = host_data.hostname()
-
-    # --- OS Detection ---
-    # nmap's OS detection returns a list of "matches" with confidence percentages
-    # We pick the most accurate guess (first one in the sorted list)
-    os_guess = "Unknown"
-    if "osmatch" in host_data and len(host_data["osmatch"]) > 0:
-        os_guess = host_data["osmatch"][0]["name"]    # e.g. "Linux 4.15 - 5.6"
-
-    # --- MAC Address and Vendor ---
-    # MAC addresses are only visible for devices on the SAME local network segment
-    # (they don't travel across routers)
-    mac_address = "Unknown"
-    vendor = "Unknown"
-
-    if "mac" in host_data["addresses"]:
-        mac_address = host_data["addresses"]["mac"]
-
-    if "vendor" in host_data and mac_address in host_data["vendor"]:
-        vendor = host_data["vendor"][mac_address]   # e.g. "Apple, Inc." or "Raspberry Pi Foundation"
-
-    # --- Port Scanning Results ---
     open_ports = []
+    lock = threading.Lock()
+    threads = []
+    total = len(TOP_PORTS)
 
-    # Loop through each protocol (typically "tcp" and/or "udp")
-    for protocol in host_data.all_protocols():
+    if socketio:
+        socketio.emit("scan_progress", {"message": f"Scanning {total} ports on {ip_address}...", "percent": 0})
 
-        # Get a sorted list of port numbers for this protocol
-        port_list = sorted(host_data[protocol].keys())
+    for i, port in enumerate(TOP_PORTS):
+        t = threading.Thread(target=check_port, args=(ip_address, port, open_ports, lock))
+        t.daemon = True
+        threads.append(t)
+        t.start()
 
-        for port in port_list:
-            port_info = host_data[protocol][port]
+        # Emit progress every 10 ports
+        if socketio and i % 10 == 0:
+            socketio.emit("scan_progress", {
+                "message": f"Scanning... ({i}/{total} ports)",
+                "percent": int((i / total) * 100)
+            })
 
-            # We only care about open ports (--open flag should handle this, but double-checking)
-            if port_info["state"] == "open":
+        # Batch: wait when we hit thread limit
+        if len(threads) >= MAX_THREADS:
+            for t in threads:
+                t.join()
+            threads = []
 
-                open_ports.append({
-                    "port": port,                          # e.g. 80
-                    "protocol": protocol,                  # e.g. "tcp"
-                    "state": port_info["state"],           # "open"
-                    "service": port_info["name"],          # e.g. "http"
-                    "version": (
-                        # Combine product name + version string + extra info if available
-                        f"{port_info.get('product', '')} "
-                        f"{port_info.get('version', '')} "
-                        f"{port_info.get('extrainfo', '')}"
-                    ).strip() or "N/A"                     # If nothing, show "N/A"
-                })
+    # Wait for remaining threads
+    for t in threads:
+        t.join()
 
-    print(f"[+] Scan complete. Found {len(open_ports)} open port(s).")
+    open_ports.sort(key=lambda x: x["port"])
+    print(f"[+] Done. {len(open_ports)} open port(s) on {ip_address}.")
 
-    # --- Build and return the final result dictionary ---
+    info = get_device_info(ip_address)
+
+    if socketio:
+        socketio.emit("scan_progress", {"message": f"Done! {len(open_ports)} open port(s) found.", "percent": 100})
+
     return {
-        "ip": ip_address,
-        "hostname": hostname,
-        "os": os_guess,
-        "mac": mac_address,
-        "vendor": vendor,
-        "ports": open_ports
+        "ip":       ip_address,
+        "hostname": info["hostname"],
+        "os":       info["os"],
+        "mac":      info["mac"],
+        "vendor":   info["vendor"],
+        "ports":    open_ports
     }

@@ -146,7 +146,7 @@ def run_scan_in_background(ip_address):
 
     try:
         # Run the actual nmap scan (this is the slow part — can take ~60 seconds)
-        result = scan_device(ip_address)
+        result = scan_device(ip_address, socketio=socketio)
 
         # Once done, emit the results to the browser via WebSocket
         # The browser listens for "scan_complete" and renders the results

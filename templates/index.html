@@ -775,7 +775,7 @@
     log(data.message, "accent");
   });
 
-  // Server says the nmap scan has begun
+  // Server says the scan has begun
   socket.on("scan_started", (data) => {
     log(`Port scan initiated on ${data.ip} — waiting for nmap...`, "accent");
   });
@@ -953,7 +953,7 @@
       if (!data.success) throw new Error(data.error || "Unknown error");
 
       log(`Server acknowledged scan request for ${selectedIP}.`, "ok");
-      log("Waiting for nmap to complete (this takes ~60 seconds)...", "warn");
+      
 
     } catch (err) {
       log(`Failed to start port scan: ${err.message}`, "error");
