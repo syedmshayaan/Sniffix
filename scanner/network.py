@@ -2,111 +2,149 @@
 # network.py
 # ============================================================
 # Discovers all devices on the local network using ARP.
-# Automatically detects the subnet and interface — no hardcoding.
+# Automatically detects the OS and uses the correct method
+# to find the active network interface and subnet.
+#
+# Linux : uses 'ip route' and 'ip addr' commands
+# Windows: uses Python's socket library directly
 # ============================================================
 
 import socket
+import platform
 import subprocess
 from scapy.layers.l2 import ARP, Ether
 from scapy.sendrecv import srp
 
 
-def get_default_interface():
+def get_subnet():
     """
-    Finds the active network interface by reading the system's
-    default route. This is the interface currently used for
-    internet traffic — i.e. the one connected to the network
-    we want to scan.
+    Detects the current OS and uses the appropriate method
+    to find the local machine's IP and derive the subnet.
 
     Returns:
-        str: interface name e.g. "wlan0", "enp0s3", "eth0"
+        tuple: (subnet, iface)
+               subnet — e.g. "192.168.29.0/24"
+               iface  — interface name (Linux) or None (Windows)
+    """
+    os_type = platform.system()   # "Windows", "Linux", or "Darwin" (Mac)
+    print(f"[*] Detected OS: {os_type}")
+
+    if os_type == "Windows":
+        return get_subnet_windows()
+    else:
+        return get_subnet_linux()
+
+
+def get_subnet_windows():
+    """
+    On Windows, we use Python's socket library to find the
+    local IP address, then derive the /24 subnet from it.
+
+    We don't need an interface name on Windows — scapy
+    auto-selects the correct adapter.
+
+    Returns:
+        tuple: (subnet, None)
     """
     try:
-        # 'ip route' lists all routes. The default route line looks like:
-        # "default via 192.168.29.1 dev wlan0 proto dhcp ..."
-        # We grab the interface name from that line.
+        # Connect a UDP socket to an external address (no data is sent)
+        # This tricks Python into revealing which IP the OS would use
+        # for outbound traffic — i.e. our actual local IP
+        temp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        temp.connect(("8.8.8.8", 80))
+        local_ip = temp.getsockname()[0]
+        temp.close()
+
+        print(f"[*] Local IP (Windows): {local_ip}")
+
+        # Derive /24 subnet from IP
+        # e.g. "192.168.29.90" → "192.168.29.0/24"
+        octets = local_ip.split(".")
+        subnet = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+        return subnet, None
+
+    except Exception as e:
+        raise RuntimeError(f"Could not detect subnet on Windows: {e}")
+
+
+def get_subnet_linux():
+    """
+    On Linux, we use 'ip route' to find the active interface,
+    then 'ip addr' to get its IP and derive the subnet.
+
+    Returns:
+        tuple: (subnet, iface)
+    """
+    try:
+        # Find default route interface
         result = subprocess.check_output(["ip", "route"], text=True)
+        iface  = None
+
         for line in result.splitlines():
             if line.startswith("default"):
-                # Line format: default via X.X.X.X dev <INTERFACE> ...
-                parts = line.split()
+                parts     = line.split()
                 dev_index = parts.index("dev")
-                return parts[dev_index + 1]   # e.g. "wlan0"
-    except Exception as e:
-        print(f"[!] Could not detect interface via ip route: {e}")
+                iface     = parts[dev_index + 1]
+                break
 
-    return None
+        if not iface:
+            raise RuntimeError("No default route found.")
 
+        print(f"[*] Active interface (Linux): {iface}")
 
-def get_subnet_for_interface(iface):
-    """
-    Given an interface name, finds its IP address and derives
-    the /24 subnet to scan.
-
-    For example: interface "wlan0" has IP "10.0.0.5"
-                 → returns "10.0.0.0/24"
-
-    Args:
-        iface (str): Network interface name
-
-    Returns:
-        str: Subnet in CIDR notation e.g. "10.0.0.0/24"
-    """
-    try:
-        # 'ip -4 addr show <iface>' shows the IPv4 address of the interface
-        # Output contains a line like: "inet 192.168.29.90/24 brd ..."
+        # Get IP address of that interface
         result = subprocess.check_output(
             ["ip", "-4", "addr", "show", iface], text=True
         )
         for line in result.splitlines():
             line = line.strip()
             if line.startswith("inet "):
-                # Extract "192.168.29.90/24" from "inet 192.168.29.90/24 brd ..."
-                ip_cidr = line.split()[1]           # e.g. "192.168.29.90/24"
-                ip      = ip_cidr.split("/")[0]     # e.g. "192.168.29.90"
+                ip_cidr = line.split()[1]
+                ip      = ip_cidr.split("/")[0]
                 octets  = ip.split(".")
                 subnet  = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
-                return subnet
-    except Exception as e:
-        print(f"[!] Could not get subnet for {iface}: {e}")
+                return subnet, iface
 
-    return None
+        raise RuntimeError(f"Could not find IP for interface {iface}.")
+
+    except Exception as e:
+        raise RuntimeError(f"Could not detect subnet on Linux: {e}")
 
 
 def scan_network():
     """
-    Auto-detects the active interface and subnet, then performs
-    an ARP scan to discover all devices on the network.
+    Auto-detects subnet and interface, then performs a
+    multi-burst ARP scan to discover all devices.
+
+    Multiple bursts help catch phones in deep sleep that
+    miss a single broadcast.
 
     Returns:
         list[dict]: Each device has 'ip', 'mac', 'hostname'
     """
 
-    # Step 1: Find active interface
-    iface = get_default_interface()
-    if not iface:
-        raise RuntimeError("Could not detect active network interface.")
-    print(f"[*] Active interface: {iface}")
+    # Step 1: Get subnet and interface
+    subnet, iface = get_subnet()
+    print(f"[*] Scanning: {subnet} | Interface: {iface or 'auto'}")
 
-    # Step 2: Derive subnet from interface IP
-    subnet = get_subnet_for_interface(iface)
-    if not subnet:
-        raise RuntimeError(f"Could not determine subnet for interface {iface}.")
-    print(f"[*] Scanning subnet: {subnet} on interface: {iface}")
-
-    # Step 3: Craft and send ARP broadcast
+    # Step 2: Craft ARP broadcast packet
     arp_packet     = ARP(pdst=subnet)
     ethernet_frame = Ether(dst="ff:ff:ff:ff:ff:ff")
     combined       = ethernet_frame / arp_packet
 
-    # Send 3 ARP bursts — phones in deep sleep often miss a single
-    # broadcast but wake up and respond to subsequent probes.
-    # We deduplicate responses across all bursts using a dict keyed by IP.
-    seen_ips = {}
+    # Step 3: Send 3 ARP bursts to catch sleeping phones
+    seen_ips = {}   # Keyed by IP to deduplicate across bursts
 
     for burst in range(3):
         print(f"[*] ARP burst {burst + 1}/3 ...")
-        answered, _ = srp(combined, iface=iface, timeout=3, verbose=False)
+
+        # On Linux: pass iface explicitly
+        # On Windows: let scapy auto-select (iface=None is ignored below)
+        kwargs = {"timeout": 3, "verbose": False}
+        if iface:
+            kwargs["iface"] = iface
+
+        answered, _ = srp(combined, **kwargs)
 
         for sent, received in answered:
             ip = received.psrc
@@ -125,11 +163,3 @@ def scan_network():
     devices = list(seen_ips.values())
     print(f"[+] Found {len(devices)} device(s) on {subnet}.")
     return devices
-
-
-# NOTE: The scan_network() function above already handles
-# multi-burst scanning via the loop below.
-# If you still miss phones, ask them to:
-#   1. Keep screen ON and unlocked
-#   2. Disable "Private Wi-Fi Address" in iPhone Wi-Fi settings
-#   3. Disable battery saver on Android
